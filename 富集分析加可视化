@@ -1,0 +1,388 @@
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(stringr)
+  library(jsonlite)
+  library(AnnotationForge)
+  library(tidyr)
+})
+
+options(stringsAsFactors = FALSE)
+
+# =========================================================
+# 0) 路径设置（按你已给的信息写好：必要时只改这几行）
+# =========================================================
+# EggNOG 注释文件所在目录（你之前的 ROC22_GO）
+annot_dir <- "C:/Users/33113/Desktop/ROC22_GO"
+
+# KEGG JSON 路径（若已有 kegg_info.RData 会优先加载，不会重复解析）
+json_path <- "D:/GXU/Zhangqinglab/RNA-seq/ko00001.json" ###用水稻的json通路进行
+
+# EggNOG 结果文件名（在 annot_dir 下）
+raw_file  <- "ROC22.egg.emapper.annotations"
+
+# 你要富集的基因列表（绝对路径）
+gene_file <- "C:/Users/33113/Desktop/mRNA_out_10_new/KEGG/targets_intersect_DEG.txt"
+
+# =========================================================
+# 1) 输出目录：自动设为 gene_file 所在目录（全部结果输出到这里）
+# =========================================================
+out_dir <- normalizePath(dirname(gene_file), winslash = "/", mustWork = FALSE)
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+cat("输出目录(out_dir):", out_dir, "\n")
+
+# =========================================================
+# 2) 读取“要富集的基因列表”（取第一列、去空行）
+# =========================================================
+if (!file.exists(gene_file)) stop("gene_file 不存在：", gene_file)
+
+genes_raw <- read.table(gene_file, header = FALSE, sep = "",
+                        stringsAsFactors = FALSE, quote = "", comment.char = "")[, 1]
+genes_raw <- unique(trimws(as.character(genes_raw)))
+genes_raw <- genes_raw[!is.na(genes_raw) & genes_raw != ""]
+cat("输入(待富集)基因数(原始):", length(genes_raw), "\n")
+if (length(genes_raw) == 0) stop("gene_file 读取后基因数为 0，请检查文件内容。")
+
+# =========================================================
+# 3) 读取 EggNOG 注释，并提取需要列（基于你原脚本逻辑）
+# =========================================================
+raw_path <- file.path(annot_dir, raw_file)
+if (!file.exists(raw_path)) stop("EggNOG 文件不存在：", raw_path)
+
+cat("正在读取 EggNOG：", raw_path, "\n")
+emapper_raw <- read.delim(raw_path,
+                          sep = "\t",
+                          quote = "",
+                          comment.char = "#",
+                          stringsAsFactors = FALSE,
+                          header = FALSE)
+
+colnames(emapper_raw) <- emapper_raw[1, ]
+emapper <- emapper_raw[-1, ]
+
+# 取你原脚本列：1,9,10,12 -> query, Preferred_name, GOs, KEGG_ko
+emapper <- emapper[, c(1, 9, 10, 12)]
+colnames(emapper) <- c("query", "Preferred_name", "GOs", "KEGG_ko")
+
+emapper[emapper == ""] <- NA
+emapper[emapper == "-"] <- NA
+
+cat("EggNOG 总基因数(unique query):", length(unique(emapper$query)), "\n")
+
+# =========================================================
+# 4) 构建“全量”注释映射（用于富集的背景/TERM2GENE）
+#    注意：富集背景需要大于你的 gene list，因此这里用全量注释，不先过滤
+# =========================================================
+gene_info_all <- emapper %>%
+  dplyr::select(GID = query, GENENAME = Preferred_name) %>%
+  mutate(GENENAME = ifelse(is.na(GENENAME), GID, GENENAME)) %>%
+  distinct()
+
+gene2go_all <- emapper %>%
+  dplyr::select(GID = query, GO = GOs) %>%
+  filter(!is.na(GO)) %>%
+  separate_rows(GO, sep = ",") %>%
+  mutate(EVIDENCE = "IEA") %>%
+  mutate(GO = str_extract(GO, "GO:[0-9]+")) %>%
+  filter(!is.na(GO)) %>%
+  distinct()
+
+gene2ko_all <- emapper %>%
+  dplyr::select(GID = query, Ko = KEGG_ko) %>%
+  filter(!is.na(Ko)) %>%
+  separate_rows(Ko, sep = ",") %>%
+  mutate(Ko = gsub("ko:", "", Ko)) %>%
+  distinct()
+
+cat("全量 gene_info 基因数:", nrow(gene_info_all), "\n")
+cat("全量 GO 记录数:", nrow(gene2go_all), "\n")
+cat("全量 KO 记录数:", nrow(gene2ko_all), "\n")
+
+# =========================================================
+# 5) KEGG：加载/解析 kegg_info（输出缓存到 out_dir）
+# =========================================================
+get_kegg_info <- function(json_file) {
+  if (!file.exists(json_file)) stop("JSON 文件不存在：", json_file)
+  kegg <- fromJSON(json_file, simplifyVector = FALSE)
+  if (is.null(kegg[["children"]])) stop("JSON 结构异常：找不到根节点 children")
+  
+  path_list <- list()
+  ko_list <- list()
+  p_count <- 0
+  
+  children_A <- kegg[["children"]]
+  for (a in seq_along(children_A)) {
+    children_B <- children_A[[a]][["children"]]
+    if (is.null(children_B)) next
+    for (b in seq_along(children_B)) {
+      pathways <- children_B[[b]][["children"]]
+      if (is.null(pathways)) next
+      for (c in seq_along(pathways)) {
+        pathway_node <- pathways[[c]]
+        pathway_info <- pathway_node[["name"]]
+        
+        pid <- str_extract(pathway_info, "ko[0-9]{5}")
+        pname <- str_remove(pathway_info, " \\[PATH:ko[0-9]{5}\\]") %>%
+          str_remove("^[0-9]{5} ")
+        
+        if (!is.na(pid) && length(pid) == 1) {
+          p_count <- p_count + 1
+          path_list[[p_count]] <- data.frame(Pathway = pid, Name = pname)
+          
+          kos_nodes <- pathway_node[["children"]]
+          if (!is.null(kos_nodes)) {
+            kos_raw <- vapply(kos_nodes, function(x) x[["name"]], character(1))
+            kos <- str_extract(kos_raw, "K[0-9]+")
+            kos <- kos[!is.na(kos)]
+            if (length(kos) > 0) {
+              ko_list[[length(ko_list) + 1]] <- data.frame(Ko = kos, Pathway = pid)
+            }
+          }
+        }
+      }
+    }
+  }
+  
+  if (length(path_list) == 0) stop("没有提取到任何 Pathway 信息。")
+  pathway2name <- do.call(rbind, path_list) %>% distinct()
+  
+  if (length(ko_list) == 0) {
+    ko2pathway <- data.frame(Ko = character(), Pathway = character())
+  } else {
+    ko2pathway <- do.call(rbind, ko_list) %>% distinct()
+  }
+  
+  list(p2n = pathway2name, k2p = ko2pathway)
+}
+
+kegg_rdata_out   <- file.path(out_dir,  "kegg_info.RData")
+kegg_rdata_annot <- file.path(annot_dir, "kegg_info.RData")
+
+if (file.exists(kegg_rdata_out)) {
+  cat("加载 KEGG 缓存：", kegg_rdata_out, "\n")
+  load(kegg_rdata_out)   # pathway2name, ko2pathway
+} else if (file.exists(kegg_rdata_annot)) {
+  cat("加载 KEGG 缓存：", kegg_rdata_annot, "\n")
+  load(kegg_rdata_annot)
+  save(pathway2name, ko2pathway, file = kegg_rdata_out)
+} else {
+  cat("未找到 kegg_info.RData，开始解析 JSON：", json_path, "\n")
+  kegg_data <- get_kegg_info(json_path)
+  pathway2name <- kegg_data$p2n
+  ko2pathway <- kegg_data$k2p
+  save(pathway2name, ko2pathway, file = kegg_rdata_out)
+}
+
+# 清洗 pathway name
+pathway2name$Name <- gsub(" \\[BR:ko[0-9]{5}\\]", "", pathway2name$Name)
+pathway2name <- pathway2name %>% na.omit() %>% distinct()
+
+# 全量 gene2pathway
+gene2pathway_all <- gene2ko_all %>%
+  inner_join(ko2pathway, by = "Ko") %>%
+  dplyr::select(GID, Pathway) %>%
+  distinct()
+
+# 输出“全量 KEGG TERM2GENE/TERM2NAME”（用于富集）
+pathway2gene_all <- gene2pathway_all[, c("Pathway", "GID")]
+write.table(pathway2name, file = file.path(out_dir, "ALL_pathway2name.txt"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+write.table(pathway2gene_all, file = file.path(out_dir, "ALL_pathway2gene.txt"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+
+# 同时输出全量 GO 映射（用于 GO enricher）
+go_term2gene_all <- gene2go_all %>% dplyr::select(Term = GO, Gene = GID) %>% distinct()
+write.table(go_term2gene_all, file = file.path(out_dir, "ALL_GO_term2gene.tsv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+
+# 统计文件（全量注释覆盖率）
+stat_all <- data.frame(
+  Metric = c("All_genes_in_emapper", "All_genes_with_GO", "All_genes_with_KO",
+             "GO_records", "KO_records", "Gene2Pathway_records"),
+  Value  = c(length(unique(emapper$query)),
+             emapper %>% filter(!is.na(GOs)) %>% distinct(query) %>% nrow(),
+             emapper %>% filter(!is.na(KEGG_ko)) %>% distinct(query) %>% nrow(),
+             nrow(gene2go_all),
+             nrow(gene2ko_all),
+             nrow(gene2pathway_all))
+)
+write.table(stat_all, file = file.path(out_dir, "ALL_annotation_stats.tsv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+
+# =========================================================
+# 6) 为了可追溯：输出“子集注释明细”（仅对你的 genes_raw 子集）
+# =========================================================
+genes_in_anno <- intersect(genes_raw, gene_info_all$GID)
+cat("待富集基因中，能在注释中匹配到的基因数:", length(genes_in_anno), "\n")
+if (length(genes_in_anno) == 0) {
+  stop("targets_intersect_DEG.txt 的ID与 EggNOG 的 query 完全不匹配，无法继续富集。")
+}
+
+emapper_sub <- emapper %>% filter(query %in% genes_in_anno)
+gene_info_sub <- gene_info_all %>% filter(GID %in% genes_in_anno)
+gene2go_sub <- gene2go_all %>% filter(GID %in% genes_in_anno)
+gene2ko_sub <- gene2ko_all %>% filter(GID %in% genes_in_anno)
+gene2pathway_sub <- gene2pathway_all %>% filter(GID %in% genes_in_anno)
+
+write.table(gene_info_sub, file = file.path(out_dir, "SUBSET_gene_info.tsv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+write.table(gene2go_sub, file = file.path(out_dir, "SUBSET_gene2go.tsv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+write.table(gene2ko_sub, file = file.path(out_dir, "SUBSET_gene2ko.tsv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+write.table(gene2pathway_sub, file = file.path(out_dir, "SUBSET_gene2pathway.tsv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+
+stat_sub <- data.frame(
+  Metric = c("Input_genes_raw", "Input_genes_in_annotation",
+             "Subset_genes_with_GO", "Subset_genes_with_KO",
+             "Subset_GO_records", "Subset_KO_records", "Subset_Gene2Pathway_records"),
+  Value = c(length(genes_raw), length(genes_in_anno),
+            gene2go_sub %>% distinct(GID) %>% nrow(),
+            gene2ko_sub %>% distinct(GID) %>% nrow(),
+            nrow(gene2go_sub),
+            nrow(gene2ko_sub),
+            nrow(gene2pathway_sub))
+)
+write.table(stat_sub, file = file.path(out_dir, "SUBSET_annotation_stats.tsv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+
+# =========================================================
+# 7) 富集分析 + 可视化（追加在脚本后面，一次性跑完）
+#    这里采用 enricher：不依赖你能否成功 library OrgDb 包（更稳）
+# =========================================================
+if (!requireNamespace("clusterProfiler", quietly = TRUE)) {
+  stop("缺少 R 包 clusterProfiler，请先安装 Bioconductor: BiocManager::install('clusterProfiler')")
+}
+if (!requireNamespace("enrichplot", quietly = TRUE)) {
+  stop("缺少 R 包 enrichplot，请先安装 Bioconductor: BiocManager::install('enrichplot')")
+}
+
+suppressPackageStartupMessages({
+  library(clusterProfiler)
+  library(enrichplot)
+})
+
+# 背景(universe)：优先用 out_dir 里是否存在 universe_ids.txt，否则用全量注释基因
+universe_file1 <- file.path(out_dir, "universe_ids.txt")
+universe_file2 <- file.path(annot_dir, "universe_ids.txt")
+
+if (file.exists(universe_file1)) {
+  universe_ids <- read.table(universe_file1, header=FALSE, stringsAsFactors=FALSE)[,1]
+  universe_ids <- unique(trimws(as.character(universe_ids)))
+  universe_ids <- universe_ids[!is.na(universe_ids) & universe_ids != ""]
+  universe_ids <- intersect(universe_ids, gene_info_all$GID)
+  cat("使用 universe_ids.txt (out_dir) 作为背景，背景基因数:", length(universe_ids), "\n")
+} else if (file.exists(universe_file2)) {
+  universe_ids <- read.table(universe_file2, header=FALSE, stringsAsFactors=FALSE)[,1]
+  universe_ids <- unique(trimws(as.character(universe_ids)))
+  universe_ids <- universe_ids[!is.na(universe_ids) & universe_ids != ""]
+  universe_ids <- intersect(universe_ids, gene_info_all$GID)
+  cat("使用 universe_ids.txt (annot_dir) 作为背景，背景基因数:", length(universe_ids), "\n")
+} else {
+  universe_ids <- gene_info_all$GID
+  cat("未找到 universe_ids.txt，使用全量注释基因作为背景，背景基因数:", length(universe_ids), "\n")
+}
+
+# 富集输入基因（确保在背景内）
+genes <- intersect(genes_in_anno, universe_ids)
+cat("用于富集的基因数(最终):", length(genes), "\n")
+if (length(genes) == 0) stop("genes 与 universe_ids 交集为 0，无法富集。")
+
+# -----------------------------
+# 7.1 KEGG（自定义 TERM2GENE/TERM2NAME）富集
+# -----------------------------
+ekk <- enricher(
+  gene          = genes,
+  universe      = universe_ids,
+  TERM2GENE     = pathway2gene_all,
+  TERM2NAME     = pathway2name,
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.2
+)
+
+ekk_df <- as.data.frame(ekk)
+write.table(ekk_df, file = file.path(out_dir, "KEGG_enrich.tsv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+
+library(ggplot2)
+library(stringr)
+
+
+kegg_n <- 12
+kegg_wrap <- 45
+kegg_height <- 8
+
+# KEGG dotplot
+p_kegg_dot <- dotplot(ekk, showCategory = kegg_n, label_format = kegg_wrap) +
+  theme(axis.text.y = element_text(size = 9))
+
+ggsave(filename = file.path(out_dir, "KEGG_dotplot_lesscrowded.pdf"),
+       plot = p_kegg_dot, width = 10, height = kegg_height)
+
+# KEGG barplot
+p_kegg_bar <- barplot(ekk, showCategory = kegg_n) +
+  scale_y_discrete(labels = function(x) str_wrap(x, width = kegg_wrap)) +
+  theme(axis.text.y = element_text(size = 9))
+
+ggsave(filename = file.path(out_dir, "KEGG_barplot_lesscrowded.pdf"),
+       plot = p_kegg_bar, width = 10, height = kegg_height)
+
+# -----------------------------
+# 7.2 GO 富集（用 enricher + GO term2gene）
+#     注：这里 term 显示为 GO:xxxx；如果你装了 GO.db，会自动补 Term 名称
+# -----------------------------
+go_term2name <- NULL
+if (requireNamespace("GO.db", quietly = TRUE) && requireNamespace("AnnotationDbi", quietly = TRUE)) {
+  suppressPackageStartupMessages(library(AnnotationDbi))
+  go_ids <- unique(go_term2gene_all$Term)
+  go_map <- tryCatch({
+    AnnotationDbi::select(GO.db::GO.db, keys = go_ids, columns = c("TERM"), keytype = "GOID")
+  }, error = function(e) NULL)
+  
+  if (!is.null(go_map) && nrow(go_map) > 0) {
+    go_term2name <- go_map %>%
+      dplyr::select(Term = GOID, Name = TERM) %>%
+      distinct()
+  }
+}
+
+ego <- enricher(
+  gene          = genes,
+  universe      = universe_ids,
+  TERM2GENE     = go_term2gene_all,
+  TERM2NAME     = go_term2name,
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.2
+)
+
+ego_df <- as.data.frame(ego)
+write.table(ego_df, file = file.path(out_dir, "GO_enrich.tsv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+
+go_n <- 12          # 你想展示多少个GO（10~15最常用）
+go_wrap <- 45       # 每行字符数，越小换行越频繁
+go_height <- 9      # 画布高度（条目多就调大，比如 10~12）
+
+# GO barplot
+p_go_bar <- barplot(ego, showCategory = go_n) +
+  scale_y_discrete(labels = function(x) str_wrap(x, width = go_wrap)) +
+  theme(axis.text.y = element_text(size = 9))
+
+ggsave(filename = file.path(out_dir, "GO_barplot_lesscrowded.pdf"),
+       plot = p_go_bar, width = 10, height = go_height)
+
+# GO dotplot（label_format 参数会自动换行；也可再叠加 str_wrap）
+p_go_dot <- dotplot(ego, showCategory = go_n, label_format = go_wrap) +
+  theme(axis.text.y = element_text(size = 9))
+
+ggsave(filename = file.path(out_dir, "GO_dotplot_lesscrowded.pdf"),
+       plot = p_go_dot, width = 10, height = go_height)
+
+cat("\n================= 完成 =================\n")
+cat("输出目录:", out_dir, "\n")
+cat("富集结果：KEGG_enrich.tsv / GO_enrich.tsv\n")
+cat("图：KEGG_dotplot.pdf / KEGG_barplot.pdf / GO_dotplot.pdf / GO_barplot.pdf\n")
+cat("映射文件：ALL_pathway2gene.txt / ALL_pathway2name.txt / ALL_GO_term2gene.tsv\n")
+cat("子集注释明细：SUBSET_gene_info.tsv / SUBSET_gene2go.tsv / SUBSET_gene2ko.tsv / SUBSET_gene2pathway.tsv\n")
