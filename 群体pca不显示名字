@@ -1,0 +1,185 @@
+## ===================== 完整版：p1(biplot 三组) + p2(三组散点/椭圆/边缘密度) + 拼图 =====================
+## 输入：C:/Users/33113/Desktop/PCA分析/data_raw.txt
+## 期望表头：Variety  SDFR  MDF  Grade
+## 特性：
+##  - 自动尝试编码（GB18030/GBK/UTF-8），并转 UTF-8 防止 invalid UTF-8
+##  - Variety 重复时自动 make.unique()，避免 row.names 重复报错
+##  - p2 也按三组显示：点/椭圆/边缘密度都按 Grade 上色
+##  - show_labels 开关控制是否显示品种名（且无引导线）
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(ggrepel)
+  library(factoextra)
+  library(ggExtra)
+  library(patchwork)
+})
+
+## ===================== 0) 参数区 =====================
+in_path <- "C:/Users/33113/Desktop/PCA分析/data_raw.txt"
+
+# 开关：TRUE 显示品种名；FALSE 关闭品种名
+show_labels <- FALSE
+
+# p2 椭圆参数
+ellipse_level <- 0.95
+ellipse_alpha <- 0.15
+
+# 你指定的三色（按 Grade 因子水平顺序映射）
+base_cols <- c("#EB6368", "#82ADD0", "#FCD28C")
+
+## ===================== 1) 读取：自动尝试编码 =====================
+read_tsv_autoenc <- function(path, encs = c("GB18030", "GBK", "UTF-8")) {
+  last_err <- NULL
+  for (enc in encs) {
+    x <- try(
+      read.delim(
+        path,
+        header = TRUE,
+        sep = "\t",
+        check.names = FALSE,
+        stringsAsFactors = FALSE,
+        fileEncoding = enc
+      ),
+      silent = TRUE
+    )
+    if (!inherits(x, "try-error")) {
+      message("读取成功：fileEncoding = ", enc, "；行=", nrow(x), "；列=", ncol(x))
+      return(list(dat = as_tibble(x), enc = enc))
+    } else {
+      last_err <- x
+    }
+  }
+  stop("读取失败：最后错误：\n", last_err)
+}
+
+tmp <- read_tsv_autoenc(in_path)
+df  <- tmp$dat
+enc_used <- tmp$enc
+
+stopifnot(all(c("Variety","SDFR","MDF","Grade") %in% colnames(df)))
+
+## ===================== 2) 统一字符列到 UTF-8，避免 invalid UTF-8 =====================
+char_cols <- names(df)[vapply(df, is.character, logical(1))]
+if (length(char_cols) > 0) {
+  df <- df %>%
+    mutate(across(all_of(char_cols), ~ iconv(as.character(.x), from = enc_used, to = "UTF-8", sub = "")))
+}
+
+## ===================== 3) 清洗与类型转换 =====================
+df <- df %>%
+  mutate(
+    Variety = trimws(as.character(Variety)),
+    Grade   = as.factor(Grade),
+    SDFR    = suppressWarnings(as.numeric(SDFR)),
+    MDF     = suppressWarnings(as.numeric(MDF))
+  ) %>%
+  filter(complete.cases(Variety, Grade, SDFR, MDF))
+
+if (nrow(df) < 3) stop("有效样本数不足（<3），无法进行 PCA。")
+
+# 行名不能重复：保证唯一（不会改变显示的 Variety，只是内部ID）
+df <- df %>% mutate(Variety_uid = make.unique(Variety))
+
+## ===================== 4) 颜色映射：按 Grade 水平顺序映射到你给的三色 =====================
+grp_levels <- levels(df$Grade)
+if (length(grp_levels) <= length(base_cols)) {
+  cols <- setNames(base_cols[seq_along(grp_levels)], grp_levels)
+} else {
+  cols <- setNames(colorRampPalette(base_cols)(length(grp_levels)), grp_levels)
+}
+print(cols)  # 控制台查看：每个 Grade -> 颜色
+
+## ===================== 5) PCA =====================
+pca <- df %>%
+  column_to_rownames(var = "Variety_uid") %>%
+  select(SDFR, MDF) %>%
+  prcomp(scale. = TRUE)
+
+var_explained <- pca$sdev^2 / sum(pca$sdev^2)
+
+## ===================== 6) p1：biplot（三组着色+椭圆） =====================
+p1 <- fviz_pca_biplot(
+  pca, axes = c(1, 2),
+  geom.ind = "point",
+  geom.var = c("arrow", "text"),
+  pointshape = 20,
+  pointsize  = 4,
+  label = "var",
+  repel = TRUE,
+  col.var = "black",
+  addEllipses = TRUE,
+  ellipse.level = 0.95,
+  habillage = df$Grade
+) +
+  scale_color_manual(values = cols) +
+  scale_fill_manual(values = cols) +
+  labs(
+    x = paste0("(PC1: ", round(var_explained[1] * 100, 2), "%)"),
+    y = paste0("(PC2: ", round(var_explained[2] * 100, 2), "%)")
+  ) +
+  theme(
+    panel.background = element_rect(fill = "white", colour = "black"),
+    axis.text = element_text(color = "black"),
+    plot.title = element_blank(),
+    legend.title = element_blank(),
+    legend.background = element_blank(),
+    legend.position = c(1, 0),
+    legend.justification = c(1, 0)
+  )
+
+## ===================== 7) p2：三组散点 + 三组椭圆 + 三组边缘密度 =====================
+scores <- as.data.frame(pca$x[, 1:2])
+colnames(scores) <- c("PC1", "PC2")
+scores$Variety_uid <- rownames(scores)
+
+scores <- scores %>%
+  left_join(df %>% select(Variety_uid, Variety, Grade), by = "Variety_uid") %>%
+  mutate(Grade = factor(Grade, levels = grp_levels))  # 强制按同一顺序
+
+p <- ggplot(scores, aes(PC1, PC2)) +
+  geom_point(aes(color = Grade), size = 2, alpha = 0.9, show.legend = FALSE) +
+  stat_ellipse(
+    aes(color = Grade, fill = Grade),
+    geom = "polygon",
+    level = ellipse_level,
+    alpha = ellipse_alpha,
+    show.legend = FALSE
+  ) +
+  scale_color_manual(values = cols) +
+  scale_fill_manual(values = cols) +
+  labs(
+    x = paste0("PC1 (", round(var_explained[1] * 100, 2), "%)"),
+    y = paste0("PC2 (", round(var_explained[2] * 100, 2), "%)")
+  ) +
+  theme_classic() +
+  theme(
+    axis.line = element_line(colour = "black"),
+    axis.title = element_text(color = "black", face = "bold"),
+    axis.text = element_text(color = "black", size = 10, face = "bold")
+  )
+
+# 开关：是否显示品种名（无引导线）
+if (show_labels) {
+  p <- p + ggrepel::geom_text_repel(
+    aes(label = Variety),
+    size = 3,
+    max.overlaps = Inf,
+    segment.color = NA
+  )
+}
+
+# 关键：groupColour/groupFill 必须 TRUE 才会在边缘显示三组
+p2 <- ggExtra::ggMarginal(
+  p,
+  type = "density",
+  groupColour = TRUE,
+  groupFill = TRUE
+)
+
+## ===================== 8) 拼图并显示 ====================A
+final_plot <- p1 + patchwork::wrap_elements(full = p2) + patchwork::plot_layout(ncol = 2)
+print(final_plot)
+
+## ===================== 9) 你确认满意后再导出（手动运行） =====================
+ggsave("C:/Users/33113/Desktop/PCA分析/结果/PCA_patchwork_3groups.png", final_plot, width=25, height=12, dpi=300)
