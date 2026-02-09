@@ -1,0 +1,454 @@
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(stringr)
+  library(DESeq2)
+  library(GO.db)
+  library(AnnotationDbi)
+  library(igraph)
+  library(patchwork)
+  library(grid)
+})
+
+#========================
+# 0) 输入文件
+#========================
+infile <- "H:/A美吉new/project/gene.count.matrix_clean.txt"  # <<< 改成你的文件
+stopifnot(file.exists(infile))
+
+outdir <- file.path(dirname(infile), paste0("DEG_GO_allPairs_", format(Sys.time(), "%Y%m%d_%H%M%S")))
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+#========================
+# 0.1) 阈值参数（补齐你原来缺失的）
+#========================
+padj_cut   <- 0.05
+log2fc_cut <- 1
+
+#========================
+# 1) 读入数据
+#========================
+raw <- readr::read_tsv(infile, show_col_types = FALSE)
+stopifnot(all(c("gene_id","go") %in% colnames(raw)))
+
+sample_cols <- grep("^S\\d+_\\d+$", colnames(raw), value = TRUE)
+stopifnot(length(sample_cols) >= 6)
+
+cts <- raw %>%
+  dplyr::select(dplyr::all_of(c("gene_id", sample_cols))) %>%
+  dplyr::mutate(
+    dplyr::across(
+      dplyr::all_of(sample_cols),
+      ~{
+        x <- suppressWarnings(as.numeric(as.character(.)))
+        x[is.na(x)] <- 0
+        as.integer(round(x))
+      }
+    )
+  ) %>%
+  dplyr::distinct(.data[["gene_id"]], .keep_all = TRUE) %>%
+  tibble::column_to_rownames("gene_id")
+
+gene2go <- raw %>%
+  dplyr::select(gene_id, go) %>%
+  dplyr::distinct(gene_id, .keep_all = TRUE)
+
+group <- sub("_.*$", "", colnames(cts))
+coldata <- data.frame(row.names = colnames(cts), group = factor(group))
+
+#========================
+# 2) 生成所有两两比较
+#========================
+groups <- sort(levels(coldata$group))
+comparisons_mat <- combn(groups, 2, simplify = TRUE)
+comparisons <- apply(comparisons_mat, 2, function(x) paste(x, collapse = "_vs_"))
+
+writeLines(c(
+  paste0("Input: ", infile),
+  paste0("Groups: ", paste(groups, collapse = ", ")),
+  paste0("Comparisons: ", paste(comparisons, collapse = " | ")),
+  paste0("padj_cut: ", padj_cut),
+  paste0("log2fc_cut: ", log2fc_cut)
+), file.path(outdir, "run_info.txt"))
+
+#========================
+# 3) DESeq2：一次建模，多次contrast取结果（关键修复）
+#========================
+dds <- DESeqDataSetFromMatrix(
+  countData = cts,
+  colData   = coldata,
+  design    = ~ group
+)
+
+# 可选：过滤极低表达（避免奇异）
+keep <- rowSums(counts(dds)) > 1
+dds <- dds[keep, ]
+
+dds <- DESeq(dds)
+
+get_deg_table <- function(A, B) {
+  res <- results(dds, contrast = c("group", A, B))
+  as.data.frame(res) %>%
+    rownames_to_column("gene_id") %>%
+    dplyr::filter(
+      !is.na(padj), padj < padj_cut,
+      !is.na(log2FoldChange), abs(log2FoldChange) >= log2fc_cut
+    ) %>%
+    dplyr::arrange(padj, desc(abs(log2FoldChange)))
+}
+
+deg_list <- setNames(vector("list", length(comparisons)), comparisons)
+
+for (comp in comparisons) {
+  A_B <- strsplit(comp, "_vs_")[[1]]
+  A <- A_B[1]; B <- A_B[2]
+  deg <- get_deg_table(A, B)
+  deg_list[[comp]] <- deg
+  readr::write_tsv(deg, file.path(outdir, paste0(comp, ".DEG.tsv")))
+}
+
+#========================
+# 4) GO 提取（修复：不再用others；Comparison正确写comp）
+#========================
+extract_go_ids <- function(x){
+  x <- as.character(x)
+  if (is.na(x) || x == "") return(character(0))
+  unique(str_extract_all(x, "GO:\\d{7}")[[1]])
+}
+
+deg_go_long <- purrr::map_dfr(comparisons, function(comp){
+  deg <- deg_list[[comp]]
+  if (is.null(deg) || nrow(deg) == 0) return(tibble())
+  
+  g2 <- gene2go %>% dplyr::filter(gene_id %in% deg$gene_id)
+  if (nrow(g2) == 0) return(tibble())
+  
+  g2 %>%
+    dplyr::mutate(GO = purrr::map(go, extract_go_ids)) %>%
+    tidyr::unnest(GO) %>%
+    dplyr::distinct(gene_id, GO) %>%
+    dplyr::mutate(Comparison = comp)
+})
+
+readr::write_tsv(deg_go_long, file.path(outdir, "deg_go_long.tsv"))
+
+if (nrow(deg_go_long) == 0) {
+  stop("deg_go_long 为 0：所有比较都未提取到 GO。请检查 go 列是否包含形如 GO:0000000 的条目，或DEG是否全为空。")
+}
+
+#========================
+# 5) GO.db 映射到 Level2
+#========================
+make_go_graph <- function(ont){
+  parents <- switch(ont,
+                    BP = as.list(GOBPPARENTS),
+                    CC = as.list(GOCCPARENTS),
+                    MF = as.list(GOMFPARENTS))
+  
+  ed <- tibble(
+    child  = rep(names(parents), lengths(parents)),
+    parent = unlist(parents, use.names = FALSE)
+  ) %>% dplyr::filter(!is.na(parent), parent != "")
+  
+  g <- igraph::graph_from_data_frame(ed, directed = TRUE)
+  
+  roots <- igraph::V(g)[igraph::degree(g, mode = "out") == 0]$name
+  vids  <- igraph::V(g)$name
+  
+  distmat <- igraph::distances(g, v = vids, to = roots, mode = "out")
+  mind <- apply(distmat, 1, min, na.rm = TRUE)
+  mind[is.infinite(mind)] <- NA_real_
+  depth_tbl <- tibble(GO = vids, depth = as.integer(mind))
+  
+  term_tbl <- AnnotationDbi::select(GO.db, keys = vids, keytype = "GOID", columns = c("GOID","TERM")) %>%
+    as_tibble() %>% transmute(GO = GOID, TERM) %>% distinct()
+  
+  list(g = g, depth = depth_tbl, term = term_tbl)
+}
+
+goBP <- make_go_graph("BP")
+goCC <- make_go_graph("CC")
+goMF <- make_go_graph("MF")
+
+get_ancestors <- function(g, go){
+  if (!go %in% igraph::V(g)$name) return(character(0))
+  as.character(igraph::subcomponent(g, v = go, mode = "out")$name)
+}
+
+map_one_to_level2go <- function(go, ont_obj){
+  anc <- get_ancestors(ont_obj$g, go)
+  if (length(anc) == 0) return(NA_character_)
+  cand <- ont_obj$depth %>%
+    dplyr::filter(GO %in% anc, depth == 2) %>%
+    dplyr::pull(GO)
+  if (length(cand) < 1) return(NA_character_)
+  cand[1]
+}
+
+ont_tbl <- AnnotationDbi::select(GO.db,
+                                 keys = unique(deg_go_long$GO),
+                                 keytype = "GOID",
+                                 columns = c("GOID","ONTOLOGY")) %>%
+  as_tibble() %>%
+  transmute(GO = GOID, Ontology = ONTOLOGY) %>%
+  dplyr::filter(Ontology %in% c("BP","CC","MF")) %>%
+  distinct()
+
+deg_go2 <- deg_go_long %>%
+  inner_join(ont_tbl, by = "GO") %>%
+  mutate(Level2_GO = case_when(
+    Ontology == "BP" ~ purrr::map_chr(GO, \(x) map_one_to_level2go(x, goBP)),
+    Ontology == "CC" ~ purrr::map_chr(GO, \(x) map_one_to_level2go(x, goCC)),
+    Ontology == "MF" ~ purrr::map_chr(GO, \(x) map_one_to_level2go(x, goMF)),
+    TRUE ~ NA_character_
+  )) %>%
+  filter(!is.na(Level2_GO))
+
+# Level2_GO -> Term（稳定处理：去重+字符化）
+term_map <- AnnotationDbi::select(
+  GO.db,
+  keys = unique(deg_go2$Level2_GO),
+  keytype = "GOID",
+  columns = c("GOID", "TERM")
+) %>% as.data.frame(stringsAsFactors = FALSE)
+
+term_map <- term_map[, c("GOID","TERM")]
+colnames(term_map) <- c("Level2_GO", "Term")
+term_map$Term <- as.character(term_map$Term)
+
+deg_go2 <- deg_go2 %>%
+  dplyr::left_join(term_map, by = "Level2_GO") %>%
+  dplyr::filter(!is.na(.data$Term), .data$Term != "")
+
+cnt <- deg_go2 %>% dplyr::count(Comparison, Ontology, Term, name = "Count")
+readr::write_tsv(cnt, file.path(outdir, "go_level2_counts.tsv"))
+
+if (nrow(cnt) == 0) {
+  stop("go_level2_counts.tsv 为 0：有GO但无法映射到Level2或Term为空。请检查GO.db版本/GOID有效性。")
+}
+
+#========================
+# 6) 作图（你原样式保留，只修逻辑依赖）
+#========================
+count_cutoff <- 10
+
+bar_gap   <- 1.0
+group_gap <- 0
+bar_width <- 0.7
+
+font_family <- "Times New Roman"
+y_break_by  <- 500
+
+col_bp <- "#E64B35"
+col_cc <- "#4DBBD5"
+col_mf <- "#00A087"
+
+band_gap_ratio    <- 0.2
+band_height_ratio <- 0.07
+title_gap_ratio   <- 0.05
+
+title_text_size  <- 10
+axis_title_size  <- 9
+axis_text_size   <- 7
+legend_text_size <- 7
+legend_key_size  <- 0.5
+panel_tag_size   <- 14
+bar_label_size   <- 2
+
+x_angle <- 60
+x_hjust <- 1
+x_vjust <- 1
+
+legend_pos <- c(0.01, 0.99)
+
+panel_tag_npc_x <- -0.03
+panel_tag_npc_y <- 1.1
+
+plot_margin_t <- 28
+plot_margin_l <- 18
+plot_margin_r <- 10
+plot_margin_b <- 8
+
+comp_pos_in_gap <- 0.70
+comp_x_left_pad <- 0.00
+
+make_one <- function(d, comp, panel_tag = "A") {
+  
+  d <- d %>% dplyr::filter(.data$Count >= count_cutoff)
+  if (nrow(d) == 0) {
+    return(ggplot() + theme_void() + ggtitle(paste0(panel_tag, "  ", comp, " (Count<", count_cutoff, ")")))
+  }
+  
+  d <- d %>%
+    mutate(Ontology = factor(Ontology, levels = c("BP","CC","MF"))) %>%
+    group_by(Ontology) %>%
+    arrange(Count, .by_group = TRUE) %>%
+    mutate(x_in = row_number()) %>%
+    ungroup()
+  
+  n_bp <- sum(d$Ontology=="BP")
+  n_cc <- sum(d$Ontology=="CC")
+  
+  span <- function(n) if (n <= 0) 0 else (n - 1) * bar_gap
+  bp_start <- 1
+  cc_start <- bp_start + span(n_bp) + group_gap + bar_gap
+  mf_start <- cc_start + span(n_cc) + group_gap + bar_gap
+  
+  d <- d %>%
+    mutate(
+      x = case_when(
+        Ontology=="BP" ~ bp_start + (x_in - 1) * bar_gap,
+        Ontology=="CC" ~ cc_start + (x_in - 1) * bar_gap,
+        Ontology=="MF" ~ mf_start + (x_in - 1) * bar_gap
+      )
+    )
+  
+  bp_df <- d %>% dplyr::filter(Ontology == "BP")
+  cc_df <- d %>% dplyr::filter(Ontology == "CC")
+  mf_df <- d %>% dplyr::filter(Ontology == "MF")
+  
+  bp_rng <- if (nrow(bp_df) > 0) c(min(bp_df$x) - bar_width/2, max(bp_df$x) + bar_width/2) else c(NA_real_, NA_real_)
+  cc_rng <- if (nrow(cc_df) > 0) c(min(cc_df$x) - bar_width/2, max(cc_df$x) + bar_width/2) else c(NA_real_, NA_real_)
+  mf_rng <- if (nrow(mf_df) > 0) c(min(mf_df$x) - bar_width/2, max(mf_df$x) + bar_width/2) else c(NA_real_, NA_real_)
+  
+  x_lab <- d %>% arrange(x) %>% distinct(x, Term)
+  
+  ymax <- max(d$Count, na.rm = TRUE)
+  if (!is.finite(ymax) || ymax <= 0) ymax <- 1
+  
+  top0 <- ymax * (1 + band_gap_ratio)
+  top1 <- top0 + ymax * band_height_ratio
+  title_y <- top1 + ymax * title_gap_ratio
+  y_top_lim <- top0
+  
+  comp_y <- ymax + comp_pos_in_gap * (top0 - ymax)
+  comp_x <- mf_rng[2] - comp_x_left_pad
+  
+  panel_tag_grob <- grid::textGrob(
+    label = panel_tag,
+    x = grid::unit(panel_tag_npc_x, "npc"),
+    y = grid::unit(panel_tag_npc_y, "npc"),
+    just = c("left", "top"),
+    gp = grid::gpar(
+      fontfamily = font_family,
+      fontface = "bold",
+      fontsize = panel_tag_size
+    )
+  )
+  
+  fill_map2 <- c(BP=col_bp, CC=col_cc, MF=col_mf)
+  legend_labs <- c(BP="biological_process", CC="cellular_component", MF="molecular_function")
+  
+  ggplot(d, aes(x = x, y = Count, fill = Ontology)) +
+    geom_col(width = bar_width) +
+    geom_text(aes(label = Count), vjust = -0.25, size = bar_label_size,
+              family = font_family, fontface = "bold") +
+    scale_fill_manual(values = fill_map2, labels = legend_labs, name = NULL) +
+    scale_x_continuous(
+      breaks = x_lab$x, labels = x_lab$Term,
+      expand = expansion(mult = c(0.01, 0.01))
+    ) +
+    scale_y_continuous(
+      breaks = seq(0, y_top_lim, by = y_break_by),
+      expand = c(0, 0)
+    ) +
+    labs(title = NULL, y = "Number of genes") +
+    theme_classic(base_size = 10) +
+    theme(
+      text = element_text(family = font_family, face = "bold"),
+      axis.title.y = element_text(size = axis_title_size, face = "bold"),
+      axis.text = element_text(size = axis_text_size, face = "bold"),
+      axis.title.x = element_blank(),
+      axis.text.x  = element_text(angle = x_angle, hjust = x_hjust, vjust = x_vjust, face = "bold"),
+      plot.margin = margin(t = plot_margin_t, r = plot_margin_r, b = plot_margin_b, l = plot_margin_l),
+      legend.position = legend_pos,
+      legend.justification = c(0, 1),
+      legend.background = element_rect(fill = "white", color = NA),
+      legend.key = element_rect(fill = "white", color = NA),
+      legend.text = element_text(size = legend_text_size, family = font_family, face = "bold"),
+      legend.key.size = grid::unit(legend_key_size, "lines")
+    ) +
+    coord_cartesian(ylim = c(0, y_top_lim), clip = "off") +
+    annotate("text", x = mean(range(d$x)), y = title_y,
+             label = "GO annotations analysis_Level 2",
+             size = title_text_size/3.0, fontface = "bold", family = font_family) +
+    {if (is.finite(bp_rng[1])) annotate("rect", xmin = bp_rng[1], xmax = bp_rng[2], ymin = top0, ymax = top1, fill = col_bp)} +
+    {if (is.finite(cc_rng[1])) annotate("rect", xmin = cc_rng[1], xmax = cc_rng[2], ymin = top0, ymax = top1, fill = col_cc)} +
+    {if (is.finite(mf_rng[1])) annotate("rect", xmin = mf_rng[1], xmax = mf_rng[2], ymin = top0, ymax = top1, fill = col_mf)} +
+    {if (is.finite(bp_rng[1])) annotate("text", x = mean(bp_rng), y = (top0+top1)/2, label = "BP",
+                                        fontface = "bold", family = font_family, size = axis_text_size/3.0)} +
+    {if (is.finite(cc_rng[1])) annotate("text", x = mean(cc_rng), y = (top0+top1)/2, label = "CC",
+                                        fontface = "bold", family = font_family, size = axis_text_size/3.0)} +
+    {if (is.finite(mf_rng[1])) annotate("text", x = mean(mf_rng), y = (top0+top1)/2, label = "MF",
+                                        fontface = "bold", family = font_family, size = axis_text_size/3.0)} +
+    annotate("text", x = comp_x, y = comp_y,
+             label = comp, hjust = 1, vjust = 0.5,
+             size = title_text_size/3.0, fontface = "bold", family = font_family) +
+    annotation_custom(panel_tag_grob)
+}
+
+panel_tags <- LETTERS[seq_along(comparisons)]
+
+plots_named <- purrr::imap(comparisons, function(cp, i){
+  dd <- cnt %>% dplyr::filter(Comparison == cp)
+  if (nrow(dd) == 0) {
+    ggplot() + theme_void() + ggtitle(paste0(panel_tags[i], "  ", cp, " (no data)"))
+  } else {
+    make_one(dd, comp = cp, panel_tag = panel_tags[i])
+  }
+})
+names(plots_named) <- comparisons
+
+final_plot <- wrap_plots(plots_named, ncol = 5)
+print(final_plot)
+
+#========================
+# 6.4 导出（SVG + PNG；每次单独目录避免覆盖）
+#========================
+each_dir <- file.path(outdir, paste0("plots_each_CountGE", count_cutoff, "_export"))
+dir.create(each_dir, showWarnings = FALSE, recursive = TRUE)
+
+for (i in seq_along(comparisons)) {
+  cp  <- comparisons[i]
+  tag <- panel_tags[i]
+  
+  # --- 单图 SVG ---
+  ggsave(
+    filename = file.path(each_dir, sprintf("%s_%s.GO_Level2.CountGE%d.svg", tag, cp, count_cutoff)),
+    plot = plots_named[[cp]],
+    device = "svg",
+    width = 10, height = 6, units = "in", dpi = 600
+  )
+  
+  # --- 单图 PNG ---
+  ggsave(
+    filename = file.path(each_dir, sprintf("%s_%s.GO_Level2.CountGE%d.png", tag, cp, count_cutoff)),
+    plot = plots_named[[cp]],
+    device = "png",
+    width = 10, height = 6, units = "in", dpi = 600
+  )
+}
+
+# --- 总图 SVG ---
+ggsave(
+  filename = file.path(outdir, sprintf("GO_Level2_multiPanels.CountGE%d.svg", count_cutoff)),
+  plot = final_plot,
+  device = "svg",
+  width = 40, height = 20, units = "in", dpi = 600
+)
+
+# --- 总图 PNG ---
+ggsave(
+  filename = file.path(outdir, sprintf("GO_Level2_multiPanels.CountGE%d.png", count_cutoff)),
+  plot = final_plot,
+  device = "png",
+  width = 40, height = 20, units = "in", dpi = 600
+)
+
+cat(
+  "完成。\n单图目录：", each_dir,
+  "\n总图SVG：", file.path(outdir, sprintf("GO_Level2_multiPanels.CountGE%d.svg", count_cutoff)),
+  "\n总图PNG：", file.path(outdir, sprintf("GO_Level2_multiPanels.CountGE%d.png", count_cutoff)),
+  "\n",
+  sep = ""
+)
+
